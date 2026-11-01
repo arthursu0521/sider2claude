@@ -559,3 +559,172 @@ for (const protocol of ['anthropic', 'openai'] as const) {
     });
   });
 }
+
+for (
+  const [deployed, stream, configured, effective] of [
+    [true, false, undefined, 70_000],
+    [true, false, '20000', 20_000],
+    [true, false, '120000', 70_000],
+    [true, true, undefined, 600_000],
+    [true, true, '120000', 120_000],
+    [false, false, undefined, 600_000],
+  ] as const
+) {
+  Deno.test(`请求锁期限：deployed=${deployed} stream=${stream} timeout=${configured ?? 'default'}`, async () => {
+    await fixture(async (f) => {
+      Deno.env.set('DENO_DEPLOYMENT_ID', deployed ? 'fixture-deployment' : '');
+      if (configured) Deno.env.set('SIDER_TOTAL_TIMEOUT_MS', configured);
+      else Deno.env.delete('SIDER_TOTAL_TIMEOUT_MS');
+      const claims: { key: string; ttl: number }[] = [];
+      const claim = f.store.claim;
+      f.store.claim = (key, holder, ttl) => {
+        claims.push({ key, ttl });
+        return claim(key, holder, ttl);
+      };
+      f.mock((body) => sse(body, '合成回答', 'p'));
+      await controller.runSiderController({
+        model: 'deepseek-v4-flash',
+        stream,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      }, crypto.randomUUID());
+      equal(claims.find((entry) => entry.key.startsWith('request:'))?.ttl, effective + 35_000);
+      equal(claims.find((entry) => entry.key.startsWith('account:'))?.ttl, effective + 5_000);
+    });
+  });
+}
+
+Deno.test('请求锁期限：模拟进程未释放锁，在有效期限和余量结束后恢复', async () => {
+  await fixture(async (f) => {
+    Deno.env.set('DENO_DEPLOYMENT_ID', 'fixture-deployment');
+    Deno.env.delete('SIDER_TOTAL_TIMEOUT_MS');
+    const originalNow = Date.now;
+    let now = originalNow(), interrupted = true, calls = 0;
+    const release = f.store.release;
+    f.store.release = (key, holder) => interrupted ? Promise.resolve() : release(key, holder);
+    Date.now = () => now;
+    f.mock((body) => {
+      calls++;
+      if (interrupted) throw new Error('合成进程中断');
+      return sse(body, '恢复后的合成回答', 'p');
+    });
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    };
+    const owner = crypto.randomUUID(), started = now;
+    try {
+      try {
+        await controller.runSiderController(req, owner);
+      } catch { /* 模拟锁未释放 */ }
+      interrupted = false;
+      for (const elapsed of [69_999, 70_000, 104_999]) {
+        now = started + elapsed;
+        let code: string | undefined;
+        try {
+          await controller.runSiderController(req, owner);
+        } catch (error) {
+          code = (error as controller.ControllerError).code;
+        }
+        equal(code, 'controller_busy');
+      }
+      now = started + 105_000;
+      const fresh = await f.restart();
+      const response = await fresh.runSiderController(req, owner);
+      equal(response.content.find((block) => block.type === 'text')?.text, '恢复后的合成回答');
+      equal(calls, 2);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+});
+
+Deno.test('请求锁期限：正常异常仍立即释放锁，无需等待 TTL', async () => {
+  await fixture(async (f) => {
+    let calls = 0;
+    f.mock((body) => {
+      if (++calls === 1) throw new Error('合成普通异常');
+      return sse(body, '恢复后的合成回答', 'p');
+    });
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    };
+    const owner = crypto.randomUUID();
+    try {
+      await controller.runSiderController(req, owner);
+    } catch { /* 下一次可立即重试 */ }
+    await controller.runSiderController(req, owner);
+    equal(calls, 2);
+  });
+});
+
+Deno.test('请求锁期限：账号重选共用原始截止时间，不能重新获得70秒', async () => {
+  await fixture(async (f) => {
+    Deno.env.set('DENO_DEPLOYMENT_ID', 'fixture-deployment');
+    Deno.env.delete('SIDER_TOTAL_TIMEOUT_MS');
+    f.mock((body) => sse(body, '合成回答', 'p'));
+    const owner = crypto.randomUUID();
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    };
+    const first = await controller.runSiderController(req, owner);
+    const session = first.sider_session!.conversation_id;
+    const key = `${await controller.controllerHash(owner)}:task:${session}`;
+    const task = (await f.store.read<Record<string, unknown>>(key))!;
+    const { siderAccountId } = await import('../src/utils/sider-accounts.ts');
+    task.account = await siderAccountId('fixture-account-2');
+    await f.store.write(key, task, 600_000);
+    Deno.env.set('SIDER_AUTH_TOKEN_1', 'fixture-account-2');
+    const fresh = await f.restart();
+    const originalNow = Date.now, originalTimeout = AbortSignal.timeout;
+    let now = originalNow(), accountClaims = 0, calls = 0;
+    const deadlines: { at: number; abort: AbortController }[] = [];
+    const advance = (ms: number) => {
+      now += ms;
+      for (const entry of deadlines) {
+        if (now >= entry.at) {
+          entry.abort.abort(new DOMException('合成请求期限已到', 'TimeoutError'));
+        }
+      }
+    };
+    Date.now = () => now;
+    AbortSignal.timeout = (ms) => {
+      const abort = new AbortController();
+      deadlines.push({ at: now + ms, abort });
+      return abort.signal;
+    };
+    const claim = f.store.claim, release = f.store.release;
+    f.store.claim = (key, holder, ttl) => {
+      if (key.startsWith('account:') && ++accountClaims === 2) advance(15_000);
+      return claim(key, holder, ttl);
+    };
+    f.store.release = async (key, holder) => {
+      await release(key, holder);
+      if (key.startsWith('account:') && accountClaims === 1) advance(60_000);
+    };
+    f.mock((body) => {
+      calls++;
+      return sse(body, '不应发送的超时回答', 'p');
+    });
+    try {
+      let status: number | undefined;
+      try {
+        await fresh.runSiderController(
+          { ...req, messages: [{ role: 'user', content: crypto.randomUUID() }] },
+          owner,
+          undefined,
+          session,
+        );
+      } catch (error) {
+        status = (error as controller.ControllerError).statusCode;
+      }
+      equal(status, 400);
+      equal(deadlines.length, 1);
+      equal(calls, 0);
+    } finally {
+      Date.now = originalNow;
+      AbortSignal.timeout = originalTimeout;
+    }
+  });
+});

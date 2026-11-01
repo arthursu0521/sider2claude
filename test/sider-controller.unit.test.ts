@@ -1038,3 +1038,125 @@ for (const protocol of ['anthropic', 'openai']) {
     });
   });
 }
+
+for (const [deployed, stream, configured, effective] of [
+  [true, false, undefined, 70_000], [true, false, '20000', 20_000],
+  [true, false, '120000', 70_000], [true, true, undefined, 600_000],
+  [true, true, '120000', 120_000], [false, false, undefined, 600_000],
+] as const) {
+  test(`Bun请求锁期限：deployed=${deployed} stream=${stream} timeout=${configured ?? 'default'}`, async () => {
+    await withUploadDiagnosticsFixture(async (f) => {
+      process.env.DENO_DEPLOYMENT_ID = deployed ? 'fixture-deployment' : '';
+      if (configured) process.env.SIDER_TOTAL_TIMEOUT_MS = configured;
+      else delete process.env.SIDER_TOTAL_TIMEOUT_MS;
+      const claims: { key: string; ttl: number }[] = [], claim = f.store.claim;
+      f.store.claim = (key: string, holder: string, ttl: number) => {
+        claims.push({ key, ttl }); return claim(key, holder, ttl);
+      };
+      f.mock((body: any) => f.sse(body, '合成回答', 'p'));
+      await runSiderController({ model: 'deepseek-v4-flash', stream,
+        messages: [{ role: 'user', content: crypto.randomUUID() }] }, crypto.randomUUID());
+      expect(claims.find((entry) => entry.key.startsWith('request:'))?.ttl).toBe(effective + 35_000);
+      expect(claims.find((entry) => entry.key.startsWith('account:'))?.ttl).toBe(effective + 5_000);
+    });
+  });
+}
+
+test('Bun请求锁期限：模拟未释放的锁，在有效期限及余量结束后恢复', async () => {
+  await withUploadDiagnosticsFixture(async (f) => {
+    process.env.DENO_DEPLOYMENT_ID = 'fixture-deployment';
+    delete process.env.SIDER_TOTAL_TIMEOUT_MS;
+    const originalNow = Date.now, release = f.store.release;
+    let now = originalNow(), interrupted = true, calls = 0;
+    f.store.release = (key: string, holder: string) => interrupted ? Promise.resolve() : release(key, holder);
+    Date.now = () => now;
+    f.mock((body: any) => {
+      calls++;
+      if (interrupted) throw new Error('合成进程中断');
+      return f.sse(body, '恢复后的合成回答', 'p');
+    });
+    const req: AnthropicRequest = { model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }] };
+    const owner = crypto.randomUUID(), started = now;
+    try {
+      try { await runSiderController(req, owner); } catch { /* 模拟锁未释放 */ }
+      interrupted = false;
+      for (const elapsed of [69_999, 70_000, 104_999]) {
+        now = started + elapsed;
+        await expect(runSiderController(req, owner)).rejects.toMatchObject({ code: 'controller_busy' });
+      }
+      now = started + 105_000;
+      f.restart();
+      await runSiderController(req, owner);
+      expect(calls).toBe(2);
+    } finally { Date.now = originalNow; }
+  });
+});
+
+test('Bun请求锁期限：正常异常仍立即释放锁', async () => {
+  await withUploadDiagnosticsFixture(async (f) => {
+    let calls = 0;
+    f.mock((body: any) => {
+      if (++calls === 1) throw new Error('合成普通异常');
+      return f.sse(body, '合成回答', 'p');
+    });
+    const req: AnthropicRequest = { model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }] }, owner = crypto.randomUUID();
+    await expect(runSiderController(req, owner)).rejects.toThrow('合成普通异常');
+    await runSiderController(req, owner);
+    expect(calls).toBe(2);
+  });
+});
+
+test('Bun请求锁期限：账号重选不能重置原始截止时间', async () => {
+  await withUploadDiagnosticsFixture(async (f) => {
+    process.env.DENO_DEPLOYMENT_ID = 'fixture-deployment';
+    delete process.env.SIDER_TOTAL_TIMEOUT_MS;
+    f.mock((body: any) => f.sse(body, '合成回答', 'p'));
+    const owner = crypto.randomUUID();
+    const req: AnthropicRequest = { model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }] };
+    const first = await runSiderController(req, owner);
+    const session = first.sider_session!.conversation_id;
+    const key = `${await controllerHash(owner)}:task:${session}`;
+    const task = await f.store.read(key);
+    process.env.SIDER_AUTH_TOKEN_1 = 'upload-bun-fixture-2';
+    const primary = await siderAccountId('upload-bun-fixture');
+    const secondary = await siderAccountId('upload-bun-fixture-2');
+    const originalNow = Date.now, originalTimeout = AbortSignal.timeout;
+    let now = originalNow(), accountClaims = 0, calls = 0;
+    const deadlines: { at: number; abort: AbortController }[] = [];
+    const advance = (ms: number) => {
+      now += ms;
+      for (const entry of deadlines) {
+        if (now >= entry.at) entry.abort.abort(new DOMException('合成请求期限已到', 'TimeoutError'));
+      }
+    };
+    Date.now = () => now;
+    AbortSignal.timeout = (ms) => {
+      const abort = new AbortController();
+      deadlines.push({ at: now + ms, abort }); return abort.signal;
+    };
+    const claim = f.store.claim, release = f.store.release;
+    f.store.claim = async (leaseKey: string, holder: string, ttl: number) => {
+      if (leaseKey.startsWith('account:')) {
+        if (++accountClaims === 1) {
+          task.account = leaseKey.includes(primary) ? secondary : primary;
+          await f.store.write(key, task, 600_000);
+        } else advance(15_000);
+      }
+      return claim(leaseKey, holder, ttl);
+    };
+    f.store.release = async (leaseKey: string, holder: string) => {
+      await release(leaseKey, holder);
+      if (leaseKey.startsWith('account:') && accountClaims === 1) advance(60_000);
+    };
+    f.mock((body: any) => { calls++; return f.sse(body, '不应发送的超时回答', 'p'); });
+    try {
+      await expect(runSiderController({ ...req, messages: [{ role: 'user', content: crypto.randomUUID() }] },
+        owner, undefined, session)).rejects.toMatchObject({ statusCode: 400 });
+      expect(deadlines).toHaveLength(1);
+      expect(calls).toBe(0);
+    } finally { Date.now = originalNow; AbortSignal.timeout = originalTimeout; }
+  });
+});

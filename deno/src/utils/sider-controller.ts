@@ -596,6 +596,14 @@ function orderedAccounts(accounts: SiderAccount[]): SiderAccount[] {
   return [...accounts.slice(start), ...accounts.slice(0, start)];
 }
 
+interface ControllerRequestLifetime {
+  deployedJson: boolean;
+  totalMs: number;
+  started: number;
+  deadline: AbortSignal;
+  combined: AbortSignal;
+}
+
 /** 主控协议独立于pro/max：从不把业务回合交给兼容后端重做。 */
 export async function runSiderController(
   request: AnthropicRequest,
@@ -618,10 +626,24 @@ export async function runSiderController(
       },
     }),
   )}`;
+  // 所有账号尝试共用一次有效期限，部署非流式最多70秒，排队与账号重选都计入。
+  const deployedJson = !!getEnv('DENO_DEPLOYMENT_ID') && !request.stream;
+  const totalMs = Math.min(
+    Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000')),
+    deployedJson ? 70_000 : Infinity,
+  );
+  const started = Date.now();
+  const deadline = AbortSignal.timeout(totalMs);
+  const lifetime: ControllerRequestLifetime = {
+    deployedJson,
+    totalMs,
+    started,
+    deadline,
+    combined: signal ? AbortSignal.any([signal, deadline]) : deadline,
+  };
   const holder = crypto.randomUUID();
-  if (
-    !await store.claim(lockKey, holder, Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000')) + 35000)
-  ) {
+  // 保留35秒中断恢复余量，避免有效请求仍在收尾时被同一请求抢占。
+  if (!await store.claim(lockKey, holder, totalMs + 35_000)) {
     throw new ControllerError('相同主控请求正在处理中，请稍后重试', 429, 1000, 'controller_busy');
   }
   try {
@@ -633,6 +655,7 @@ export async function runSiderController(
         token,
         accounts,
         candidates,
+        lifetime,
         signal,
         session,
         sink,
@@ -671,6 +694,7 @@ async function runSiderControllerOnce(
   token: string,
   accounts: SiderAccount[],
   candidates: SiderAccount[],
+  lifetime: ControllerRequestLifetime,
   signal?: AbortSignal,
   session?: string,
   sink?: ControllerTextSink,
@@ -688,15 +712,7 @@ async function runSiderControllerOnce(
   }
   const store = await getControllerStore();
   const owner = await controllerHash(token);
-  // 部署平台限制非流式首字节等待；保存进度后以小批登记让客户端继续。
-  const deployedJson = !!getEnv('DENO_DEPLOYMENT_ID') && !request.stream;
-  const totalMs = Math.min(
-    Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000')),
-    deployedJson ? 70_000 : Infinity,
-  );
-  const deadline = AbortSignal.timeout(totalMs);
-  const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
-  const started = Date.now();
+  const { deployedJson, totalMs, deadline, combined, started } = lifetime;
   return await withControllerLease(
     store,
     candidates,
@@ -704,6 +720,7 @@ async function runSiderControllerOnce(
     combined,
     totalMs,
     async (account) => {
+      if (combined.aborted) throw combined.reason;
       const replayKey = `${owner}:response:${await controllerHash(
         JSON.stringify({
           session: session ?? null,
