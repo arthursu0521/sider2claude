@@ -143,17 +143,18 @@ function copySessionHeaders(from: Response, to: Response): void {
   }
 }
 
-async function extractErrorMessage(response: Response): Promise<string> {
+async function extractErrorDetails(response: Response): Promise<{ message: string; code?: string }> {
   const text = await response.text();
   try {
     const data = JSON.parse(text);
-    return data?.error?.message || data?.message || text;
+    return { message: data?.error?.message || data?.message || text,
+      ...(typeof data?.error?.code === 'string' ? { code: data.error.code } : {}) };
   } catch {
-    return text || response.statusText;
+    return { message: text || response.statusText };
   }
 }
 
-function openAIError(error: unknown, status: number, headers?: HeadersInit): Response {
+function openAIError(error: unknown, status: number, headers?: HeadersInit, detailCode?: string): Response {
   const message = error instanceof Error ? error.message : String(error);
   return Response.json({
     error: {
@@ -164,6 +165,7 @@ function openAIError(error: unknown, status: number, headers?: HeadersInit): Res
         ? 'rate_limit_exceeded'
         : 'api_error',
       code: status === 429 ? 'rate_limit_exceeded' : null,
+      ...(detailCode ? { details: { code: detailCode } } : {}),
     },
   }, { status, headers: headers ?? {} });
 }
@@ -176,9 +178,9 @@ export async function protocolErrorResponse(
   response: Response,
   format: 'openai' | 'gemini',
 ): Promise<Response> {
-  const message = await extractErrorMessage(response);
+  const { message, code } = await extractErrorDetails(response);
   return format === 'openai'
-    ? openAIError(message, response.status, retryHeaders(response))
+    ? openAIError(message, response.status, retryHeaders(response), code)
     : geminiError(message, response.status, retryHeaders(response));
 }
 
@@ -272,7 +274,9 @@ function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Resp
       // 上游失败在 Anthropic 流里是 error 事件；丢弃它会让 OpenAI 客户端
       // 只收到空 chunk 流 + [DONE]，无法得知限流或故障。
       if (event.type === 'error') {
-        const err = event.error as { type?: string; message?: string; retry_after?: number } | undefined;
+        const err = event.error as
+          | { type?: string; message?: string; retry_after?: number; code?: string }
+          | undefined;
         send({
           id,
           object: 'chat.completion.chunk',
@@ -282,6 +286,7 @@ function mapAnthropicStreamToOpenAIChat(response: Response, model: string): Resp
           error: {
             type: err?.type ?? 'upstream_error', message: err?.message ?? 'upstream error',
             ...(err?.retry_after !== undefined ? { retry_after: err.retry_after } : {}),
+            ...(err?.code ? { details: { code: err.code } } : {}),
           },
         });
       }

@@ -1,0 +1,561 @@
+import * as controller from '../src/utils/sider-controller.ts';
+import { controllerResponse } from '../src/utils/controller-http.ts';
+import { ControllerKvStore, getControllerStore } from '../src/utils/controller-storage.ts';
+import { createRequestLogContext } from '../src/utils/request-observability.ts';
+import type { AnthropicRequest } from '../src/types/anthropic.ts';
+import type { SiderRequest } from '../src/types/index.ts';
+
+function equal(actual: unknown, expected: unknown) {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`期望${JSON.stringify(expected)}，实际${JSON.stringify(actual)}`);
+  }
+}
+type Checkpoint = {
+  cid: string;
+  parent: string;
+  uploads?: Record<string, number>;
+  pendingUpload?: string;
+};
+function sse(body: SiderRequest, text: string, parent: string) {
+  return new Response(
+    [
+      {
+        code: 0,
+        data: {
+          type: 'message_start',
+          model: body.model,
+          message_start: {
+            cid: body.cid || 'fixture-cid',
+            user_message_id: 'u',
+            assistant_message_id: parent,
+          },
+        },
+      },
+      { code: 0, data: { type: 'text', model: body.model, text } },
+    ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream' } },
+  );
+}
+function request(): AnthropicRequest {
+  return {
+    model: 'deepseek-v4-flash',
+    stream: true,
+    system: '合成测试规范。'.repeat(600),
+    messages: [{ role: 'user', content: crypto.randomUUID() }],
+  };
+}
+function part(body: SiderRequest): number | undefined {
+  const match = body.multi_content[0]!.text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+  if (match) equal(Number(match[2]), 2);
+  return match ? Number(match[1]) : undefined;
+}
+
+async function fixture(
+  run: (f: {
+    store: Awaited<ReturnType<typeof getControllerStore>>;
+    snapshots: Checkpoint[];
+    logs: unknown[][];
+    restart: () => Promise<typeof controller>;
+    checkpoint: () => Promise<Checkpoint>;
+    mock: (fn: (body: SiderRequest) => Response | Promise<Response>) => void;
+  }) => Promise<void>,
+) {
+  const env = {
+    SIDER_AUTH_TOKEN: 'fixture-account',
+    SIDER_CONTROLLER_STORAGE: 'memory',
+    SIDER_CONTROLLER: 'true',
+    SIDER_CONTROLLER_STREAMING: 'true',
+    SIDER_CONTROLLER_PACE_MS: '0',
+    SIDER_CONTROLLER_PACE_MIN_MS: '0',
+    SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000',
+    SIDER_CONTROLLER_STREAM_COMMIT_MS: '20000',
+    DENO_DEPLOYMENT_ID: '',
+    SIDER_TOTAL_TIMEOUT_MS: '5000',
+    AUTH_TOKEN: 'fixture-client',
+  };
+  for (let i = 1; i <= 8; i++) Object.assign(env, { [`SIDER_AUTH_TOKEN_${i}`]: '' });
+  const previous = new Map(Object.keys(env).map((key) => [key, Deno.env.get(key)]));
+  for (const [key, value] of Object.entries(env)) Deno.env.set(key, value);
+  const kv = await Deno.openKv(':memory:');
+  let storage = new ControllerKvStore(kv);
+  const store = await getControllerStore();
+  const original = {
+    read: store.read,
+    write: store.write,
+    claim: store.claim,
+    release: store.release,
+    fetch: globalThis.fetch,
+    info: console.info,
+    warn: console.warn,
+    log: console.log,
+    error: console.error,
+  };
+  const snapshots: Checkpoint[] = [], logs: unknown[][] = [];
+  let taskKey = '';
+  store.read = (key) => storage.read(key);
+  store.write = async (key, value, ttl) => {
+    await storage.write(key, value, ttl);
+    if (/^[a-f0-9]+:task:/.test(key)) {
+      taskKey = key;
+      snapshots.push(structuredClone(value) as Checkpoint);
+    }
+  };
+  store.claim = (key, holder, ttl) => storage.claim(key, holder, ttl);
+  store.release = (key, holder) => storage.release(key, holder);
+  console.info =
+    console.warn =
+    console.log =
+    console.error =
+      (...args) => {
+        logs.push(args);
+      };
+  try {
+    await run({
+      store,
+      snapshots,
+      logs,
+      restart: async () => {
+        // 重建控制器模块和存储适配器，只保留共享 KV；读取获得新对象。
+        storage = new ControllerKvStore(kv);
+        return await import(`../src/utils/sider-controller.ts?cold=${crypto.randomUUID()}`);
+      },
+      checkpoint: async () => (await storage.read<Checkpoint>(taskKey))!,
+      mock: (fn) => {
+        globalThis.fetch = ((url, init) => {
+          if (!String(url).includes('sider.ai')) throw new Error('禁止调用非 mock 上游');
+          return Promise.resolve(fn(JSON.parse(String(init?.body))));
+        }) as typeof fetch;
+      },
+    });
+  } finally {
+    Object.assign(store, {
+      read: original.read,
+      write: original.write,
+      claim: original.claim,
+      release: original.release,
+    });
+    globalThis.fetch = original.fetch;
+    Object.assign(console, {
+      info: original.info,
+      warn: original.warn,
+      log: original.log,
+      error: original.error,
+    });
+    kv.close();
+    for (const [key, value] of previous) {
+      if (value === undefined) Deno.env.delete(key);
+      else Deno.env.set(key, value);
+    }
+  }
+}
+
+Deno.test('上传诊断：明确 ACK 的会话父节点与分片检查点一次提交', async () => {
+  await fixture(async (f) => {
+    const calls: (number | string)[] = [];
+    f.mock((body) => {
+      const index = part(body);
+      calls.push(index ?? 'answer');
+      if (index === 2) equal(body.parent_message_id, 'p1');
+      return sse(body, index ? `已记住${index}/2` : '真实合成回答', index ? `p${index}` : 'answer');
+    });
+    const result = await controller.runSiderController(request(), 'ack-owner');
+    equal(calls, [1, 2, 'answer']);
+    equal(result.content.find((block) => block.type === 'text')?.text, '真实合成回答');
+    for (const index of [1, 2]) {
+      equal(
+        f.snapshots.some((s) =>
+          s.parent === `p${index}` &&
+          !Object.values(s.uploads ?? {}).includes(index)
+        ),
+        false,
+      );
+    }
+    equal((await f.checkpoint()).pendingUpload, undefined);
+  });
+});
+
+for (
+  const [failedPart, reply, category] of [
+    [1, '这是一段合成的普通分析答案。'.repeat(100), 'missing_ack'],
+    [2, '这是一段合成的普通分析答案。'.repeat(100), 'missing_ack'],
+    [2, '已收到，但我不能接受或记住这些片段。', 'explicit_rejection'],
+  ] as const
+) {
+  Deno.test(`上传诊断：第${failedPart}片 ${category} 后跨实例从已确认父节点重试`, async () => {
+    await fixture(async (f) => {
+      const calls: (number | string)[] = [];
+      let failed = false;
+      f.mock((body) => {
+        const index = part(body);
+        calls.push(index ?? 'answer');
+        equal(body.cid, index === 1 ? '' : 'fixture-cid');
+        equal(body.parent_message_id, index === 1 ? undefined : index === 2 ? 'p1' : 'p2');
+        if (index === failedPart && !failed) {
+          failed = true;
+          return sse(body, reply, 'unconfirmed-parent');
+        }
+        return sse(
+          body,
+          index ? `已记住${index}/2` : '真实合成回答',
+          index ? `p${index}` : 'answer',
+        );
+      });
+      const req = request(), owner = crypto.randomUUID();
+      let caught: unknown;
+      try {
+        await controller.runSiderController(req, owner);
+      } catch (error) {
+        caught = error;
+      }
+      equal(caught instanceof controller.ControllerError, true);
+      equal(calls, failedPart === 1 ? [1] : [1, 2]);
+      const before = await f.checkpoint();
+      equal([before.cid, before.parent], failedPart === 1 ? ['', ''] : ['fixture-cid', 'p1']);
+      equal(Object.values(before.uploads ?? {}), failedPart === 1 ? [] : [1]);
+      equal(typeof before.pendingUpload, 'string');
+      equal((caught as { code?: string }).code, 'context_unconfirmed');
+      const resumed = await f.restart();
+      const result = await resumed.runSiderController(req, owner);
+      equal(calls, failedPart === 1 ? [1, 1, 2, 'answer'] : [1, 2, 2, 'answer']);
+      equal(result.content.find((block) => block.type === 'text')?.text, '真实合成回答');
+      equal((await f.checkpoint()).pendingUpload, undefined);
+      const diagnostics = f.logs.map((args) => args[1] as Record<string, unknown>)
+        .filter((entry) => entry?.event === 'controller_context_upload');
+      equal(diagnostics.some((entry) => entry.ack === category), true);
+      equal(diagnostics.some((entry) => entry.resumed === true), true);
+      equal(JSON.stringify(f.logs).includes(reply), false);
+    });
+  });
+}
+
+Deno.test('上传诊断：多账号同时首次处理同一请求不能双重发送', async () => {
+  await fixture(async (f) => {
+    Deno.env.set('SIDER_AUTH_TOKEN_1', 'fixture-account-2');
+    const fresh = await f.restart();
+    const gate = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const duplicate = Promise.withResolvers<void>();
+    const write = f.store.write;
+    let taskWrites = 0, calls = 0;
+    f.store.write = async (key, value, ttl) => {
+      if (/^[a-f0-9]+:task:/.test(key)) {
+        taskWrites++;
+        if (taskWrites === 1) entered.resolve();
+        else duplicate.resolve();
+        await gate.promise;
+      }
+      await write(key, value, ttl);
+    };
+    f.mock((body) => {
+      calls++;
+      return sse(body, '真实回答', 'answer');
+    });
+    const req: AnthropicRequest = {
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: crypto.randomUUID() }],
+    };
+    const first = controller.runSiderController(req, 'concurrent-owner');
+    await entered.promise;
+    const second = fresh.runSiderController(req, 'concurrent-owner').catch((error) => error);
+    await Promise.race([duplicate.promise, second]);
+    gate.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    equal(calls, 1);
+    if (b instanceof Error) equal((b as { statusCode?: number }).statusCode, 429);
+    else equal(a.id, b.id);
+  });
+});
+
+Deno.test('上传诊断：ACK 检查点写入失败后重建实例不会跳片', async () => {
+  await fixture(async (f) => {
+    const write = f.store.write;
+    let failWrite = true;
+    f.store.write = async (key, value, ttl) => {
+      const task = value as Checkpoint;
+      if (/:task:/.test(key) && task.parent === 'p2' && failWrite) {
+        failWrite = false;
+        throw new Error('合成存储中断');
+      }
+      await write(key, value, ttl);
+    };
+    const calls: (number | string)[] = [];
+    f.mock((body) => {
+      const index = part(body);
+      calls.push(index ?? 'answer');
+      return sse(body, index ? `已记住${index}/2` : '真实回答', index ? `p${index}` : 'answer');
+    });
+    const req = request(), owner = crypto.randomUUID();
+    let error: unknown;
+    try {
+      await controller.runSiderController(req, owner);
+    } catch (caught) {
+      error = caught;
+    }
+    equal((error as Error).message, '合成存储中断');
+    equal((await f.checkpoint()).parent, 'p1');
+    equal(Object.values((await f.checkpoint()).uploads ?? {}), [1]);
+    const fresh = await f.restart();
+    await fresh.runSiderController(req, owner);
+    equal(calls, [1, 2, 2, 'answer']);
+  });
+});
+
+Deno.test('上传诊断：不同任务可并发且续轮保持各自会话', async () => {
+  await fixture(async (f) => {
+    Deno.env.set('SIDER_AUTH_TOKEN_1', 'fixture-account-2');
+    const fresh = await f.restart();
+    const both = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    f.mock(async (body) => {
+      calls.push(body.cid);
+      if (calls.length === 2) both.resolve();
+      if (calls.length <= 2) await both.promise;
+      const cid = body.cid || (body.multi_content[0]!.text.includes('任务甲') ? 'cid-a' : 'cid-b');
+      return sse({ ...body, cid }, '真实回答', `${cid}-parent`);
+    });
+    const owner = crypto.randomUUID();
+    const req = (text: string): AnthropicRequest => ({
+      model: 'deepseek-v4-flash',
+      messages: [{ role: 'user', content: text }],
+    });
+    const [a, b] = await Promise.all([
+      controller.runSiderController(req('任务甲'), owner),
+      fresh.runSiderController(req('任务乙'), owner),
+    ]);
+    equal(calls, ['', '']);
+    equal(a.sider_session!.conversation_id === b.sider_session!.conversation_id, false);
+    await controller.runSiderController(
+      req('甲继续'),
+      owner,
+      undefined,
+      a.sider_session!.conversation_id,
+    );
+    await fresh.runSiderController(
+      req('乙继续'),
+      owner,
+      undefined,
+      b.sider_session!.conversation_id,
+    );
+    equal(calls.slice(2), ['cid-a', 'cid-b']);
+  });
+});
+
+async function sendProtocol(req: AnthropicRequest, protocol: 'anthropic' | 'openai') {
+  if (protocol === 'anthropic') {
+    return await controllerResponse(
+      req,
+      'fixture-client',
+      createRequestLogContext(req, 'req-fixture'),
+    );
+  }
+  const { default: router } = await import('../src/routes/protocols.ts');
+  return await router.request('/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': 'fixture-client' },
+    body: JSON.stringify({
+      model: req.model,
+      stream: req.stream,
+      messages: [...(req.system ? [{ role: 'system', content: req.system }] : []), ...req.messages],
+    }),
+  });
+}
+
+for (const protocol of ['anthropic', 'openai'] as const) {
+  Deno.test(`上传诊断 HTTP：${protocol} 开流前非 ACK 保留 502 原因和机器码，不附带限流头`, async () => {
+    await fixture(async (f) => {
+      const secret = 'fixture-private-response-Authorization-Bearer-token';
+      let calls = 0;
+      f.mock((body) => {
+        calls++;
+        return sse(body, secret.repeat(30), 'rejected');
+      });
+      const req = request();
+      const response = await sendProtocol(req, protocol);
+      equal(response.status, 502);
+      equal(response.headers.get('retry-after'), null);
+      const json = await response.json();
+      equal(
+        protocol === 'openai' ? json.error.details?.code : json.error.code,
+        'context_unconfirmed',
+      );
+      equal(json.error.message.includes('未确认上下文分片1/2'), true);
+      equal(calls, 1);
+      equal(JSON.stringify(json).includes(secret), false);
+      const logs = JSON.stringify(f.logs);
+      for (const privateText of [secret, req.system, req.messages[0]!.content, 'fixture-account']) {
+        equal(logs.includes(String(privateText)), false);
+      }
+      const diagnostic = f.logs.map((args) => args[1] as Record<string, unknown>)
+        .find((entry) => entry?.event === 'controller_context_upload')!;
+      equal(diagnostic.ack, 'missing_ack');
+      equal(diagnostic.responseChars, secret.length * 30);
+      equal([diagnostic.chunkIndex, diagnostic.chunkCount], [1, 2]);
+      equal(String(diagnostic.contextHash).length, 16);
+      equal(typeof diagnostic.requestId, 'string');
+      equal(diagnostic.model, req.model);
+      if (protocol === 'anthropic') equal(diagnostic.requestId, 'req-fixture');
+    });
+  });
+
+  Deno.test(`上传诊断 HTTP：${protocol} 供应商1135保留429及60秒退避`, async () => {
+    await fixture(async (f) => {
+      f.mock(() =>
+        new Response(
+          'data: ' + JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.' }) +
+            '\n\n',
+          { headers: { 'content-type': 'text/event-stream' } },
+        )
+      );
+      const response = await sendProtocol({
+        model: 'deepseek-v4-flash',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      }, protocol);
+      equal(response.status, 429);
+      equal(response.headers.get('retry-after'), '60');
+      const json = await response.json();
+      equal(protocol === 'openai' ? json.error.details?.code : json.error.code, 'sider_1135');
+    });
+  });
+
+  Deno.test(`上传诊断 HTTP：${protocol} 登记检查点429保持原续传语义并可辨识`, async () => {
+    await fixture(async (f) => {
+      Deno.env.set('DENO_DEPLOYMENT_ID', 'fixture-deployment');
+      f.mock((body) => sse(body, `已记住${part(body)}/2`, `p${part(body)}`));
+      const response = await sendProtocol({ ...request(), stream: false }, protocol);
+      equal(response.status, 429);
+      equal(response.headers.get('retry-after'), '1');
+      const json = await response.json();
+      equal(
+        protocol === 'openai' ? json.error.details?.code : json.error.code,
+        'context_checkpoint',
+      );
+      equal(json.error.message.includes('上下文登记进度2/2'), true);
+      equal(Object.values((await f.checkpoint()).uploads ?? {}), [2]);
+    });
+  });
+
+  Deno.test(`上传诊断 HTTP：${protocol} 正文已流出后失败必须有错误事件`, async () => {
+    await fixture(async (f) => {
+      f.mock((body) => {
+        const bytes = new TextEncoder();
+        let sent = false;
+        return new Response(
+          new ReadableStream({
+            pull(stream) {
+              if (sent) {
+                stream.error(new Error('合成上游流中断'));
+                return;
+              }
+              sent = true;
+              stream.enqueue(bytes.encode(
+                [
+                  {
+                    code: 0,
+                    data: {
+                      type: 'message_start',
+                      model: body.model,
+                      message_start: {
+                        cid: 'stream-cid',
+                        user_message_id: 'u',
+                        assistant_message_id: 'p',
+                      },
+                    },
+                  },
+                  { code: 0, data: { type: 'text', model: body.model, text: '合成正文开头' } },
+                ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+              ));
+            },
+          }),
+          { headers: { 'content-type': 'text/event-stream' } },
+        );
+      });
+      const response = await sendProtocol({
+        model: 'deepseek-v4-flash',
+        stream: true,
+        messages: [{ role: 'user', content: crypto.randomUUID() }],
+      }, protocol);
+      equal(response.status, 200);
+      const text = await response.text();
+      equal(text.includes('合成正文开头'), true);
+      equal(text.includes('"error"'), true);
+      equal(text.includes('"finish_reason":"stop"'), false);
+      equal(text.includes('event: message_stop'), false);
+      if (protocol === 'anthropic') {
+        equal(text.indexOf('event: content_block_stop') < text.indexOf('event: error'), true);
+      }
+    });
+  });
+}
+
+Deno.test('上传诊断：默认日志不包含凭证、用户正文或历史工具参数', async () => {
+  await fixture(async (f) => {
+    const id = crypto.randomUUID();
+    const req: AnthropicRequest = {
+      ...request(),
+      tools: [{
+        name: 'Bash',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command'],
+        },
+      }],
+      messages: [
+        { role: 'user', content: 'private_user_body Authorization: Bearer private_client_token' },
+        {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            id,
+            name: 'Bash',
+            input: { command: 'private_tool_parameter' },
+          }],
+        },
+        {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: id, content: 'private_tool_result' }],
+        },
+      ],
+    };
+    f.mock((body) => sse(body, 'private_model_echo'.repeat(100), 'unconfirmed'));
+    const response = await controllerResponse(
+      req,
+      'private_client_token',
+      createRequestLogContext(req),
+    );
+    equal(response.status, 502);
+    const logs = JSON.stringify(f.logs);
+    for (
+      const secret of [
+        'private_user_body',
+        'Authorization:',
+        'private_client_token',
+        'private_tool_parameter',
+        'private_tool_result',
+        'private_model_echo',
+        'fixture-account',
+        String(req.system),
+      ]
+    ) equal(logs.includes(secret), false);
+  });
+});
+
+for (const protocol of ['anthropic', 'openai'] as const) {
+  Deno.test(`上传诊断 HTTP：${protocol} 已提交 SSE 的非 ACK 保留机器原因且无成功结束`, async () => {
+    await fixture(async (f) => {
+      Deno.env.set('SIDER_CONTROLLER_STREAM_COMMIT_MS', '0');
+      f.mock((body) => sse(body, '合成普通答案。'.repeat(150), 'unconfirmed'));
+      const response = await sendProtocol(request(), protocol);
+      equal(response.status, 200);
+      const text = await response.text();
+      const events = text.split('\n').filter((line) => line.startsWith('data: {'))
+        .map((line) => JSON.parse(line.slice(6)));
+      const error = events.find((event) => event.error)?.error;
+      equal(protocol === 'openai' ? error?.details?.code : error?.code, 'context_unconfirmed');
+      equal(text.includes('合成普通答案'), false);
+      equal(text.includes('event: message_stop'), false);
+      equal(text.includes('"finish_reason":"stop"'), false);
+    });
+  });
+}

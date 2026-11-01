@@ -857,3 +857,184 @@ test('Bun主控流式：开流前撞1135返回HTTP 429与Retry-After；提交窗
     });
   }
 });
+
+async function withUploadDiagnosticsFixture(run: (f: any) => Promise<void>) {
+  const vars: Record<string, string> = { SIDER_AUTH_TOKEN: 'upload-bun-fixture',
+    SIDER_CONTROLLER_STORAGE: 'memory', SIDER_CONTROLLER_PACE_MS: '0',
+    SIDER_CONTROLLER_PACE_MIN_MS: '0', SIDER_CONTROLLER_MAX_INPUT_CHARS: '3000',
+    SIDER_CONTROLLER_STREAM_COMMIT_MS: '20000', SIDER_TOTAL_TIMEOUT_MS: '5000',
+    SIDER_CONTROLLER: 'true', DENO_DEPLOYMENT_ID: '', AUTH_TOKEN: 'upload-bun-client' };
+  for (let i = 1; i <= 8; i++) vars[`SIDER_AUTH_TOKEN_${i}`] = '';
+  const previous = Object.keys(vars).map((key) => [key, process.env[key]]);
+  Object.assign(process.env, vars);
+  const store = await getControllerStore();
+  const db = new Database(':memory:');
+  let backing = new ControllerSqliteStore(db);
+  const original = { read: store.read, write: store.write, claim: store.claim, release: store.release,
+    fetch: globalThis.fetch, info: console.info, warn: console.warn, log: console.log, error: console.error };
+  const snapshots: any[] = [], logs: unknown[][] = [];
+  let taskKey = '';
+  store.read = (key) => backing.read(key);
+  store.write = async (key, value, ttl) => {
+    await backing.write(key, value, ttl);
+    if (/^[a-f0-9]+:task:/.test(key)) { taskKey = key; snapshots.push(structuredClone(value)); }
+  };
+  store.claim = (key, holder, ttl) => backing.claim(key, holder, ttl);
+  store.release = (key, holder) => backing.release(key, holder);
+  console.info = console.warn = console.log = console.error = (...args) => { logs.push(args); };
+  const sse = (body: any, text: string, parent: string) => new Response([
+    { code: 0, data: { type: 'message_start', model: body.model,
+      message_start: { cid: body.cid || 'upload-bun-cid', user_message_id: 'u', assistant_message_id: parent } } },
+    { code: 0, data: { type: 'text', model: body.model, text } },
+  ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''),
+    { headers: { 'content-type': 'text/event-stream' } });
+  const request = (): AnthropicRequest => ({ model: 'deepseek-v4-flash', stream: true,
+    system: '合成测试规范。'.repeat(600),
+    messages: [{ role: 'user', content: crypto.randomUUID() }] });
+  try {
+    await run({ store, snapshots, logs, sse, request,
+      restart: () => { backing = new ControllerSqliteStore(db); },
+      checkpoint: () => backing.read(taskKey),
+      mock: (fn: (body: any) => Response) => {
+        globalThis.fetch = ((url, init) => {
+          if (!String(url).includes('sider.ai')) throw new Error('禁止调用非 mock 上游');
+          return Promise.resolve(fn(JSON.parse(String(init?.body))));
+        }) as typeof fetch;
+      },
+    });
+  } finally {
+    Object.assign(store, { read: original.read, write: original.write, claim: original.claim, release: original.release });
+    globalThis.fetch = original.fetch;
+    Object.assign(console, { info: original.info, warn: original.warn, log: original.log, error: original.error });
+    db.close();
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key!];
+      else process.env[key!] = value;
+    }
+  }
+}
+
+for (const reply of ['合成普通分析答案。'.repeat(150), '已收到，但我不能接受或记住这些片段。']) {
+  test('Bun上传诊断：第二片未确认时保存已确认父节点，重建存储后从第二片恢复', async () => {
+    await withUploadDiagnosticsFixture(async (f) => {
+      let failed = false;
+      const calls: (number | string)[] = [];
+      f.mock((body: any) => {
+        const part = body.multi_content[0].text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+        const index = part ? Number(part[1]) : undefined;
+        calls.push(index ?? 'answer');
+        expect(body.cid).toBe(index === 1 ? '' : 'upload-bun-cid');
+        expect(body.parent_message_id).toBe(index === 1 ? undefined : index === 2 ? 'p1' : 'p2');
+        if (index === 2 && !failed) { failed = true; return f.sse(body, reply, 'unconfirmed'); }
+        if (index === 2) expect(body.parent_message_id).toBe('p1');
+        return f.sse(body, index ? `已记住${index}/2` : '真实回答', index ? `p${index}` : 'answer');
+      });
+      const req = f.request(), owner = crypto.randomUUID();
+      await expect(runSiderController(req, owner)).rejects.toMatchObject({ statusCode: 502, code: 'context_unconfirmed' });
+      const before = await f.checkpoint();
+      expect([before.cid, before.parent]).toEqual(['upload-bun-cid', 'p1']);
+      expect(Object.values(before.uploads)).toEqual([1]);
+      expect(typeof before.pendingUpload).toBe('string');
+      f.restart();
+      await runSiderController(req, owner);
+      expect(calls).toEqual([1, 2, 2, 'answer']);
+      expect((await f.checkpoint()).pendingUpload).toBeUndefined();
+      for (const index of [1, 2]) {
+        expect(f.snapshots.some((s: any) => s.parent === `p${index}` &&
+          !Object.values(s.uploads ?? {}).includes(index))).toBe(false);
+      }
+      expect(JSON.stringify(f.logs)).not.toContain(reply);
+    });
+  });
+}
+
+test('Bun上传诊断：多账号首次并发相同请求只发送一次', async () => {
+  await withUploadDiagnosticsFixture(async (f) => {
+    process.env.SIDER_AUTH_TOKEN_1 = 'upload-bun-fixture-2';
+    const gate = Promise.withResolvers<void>(), entered = Promise.withResolvers<void>();
+    const duplicate = Promise.withResolvers<void>();
+    const write = f.store.write;
+    let writes = 0, calls = 0;
+    f.store.write = async (key: string, value: unknown, ttl: number) => {
+      if (/^[a-f0-9]+:task:/.test(key)) {
+        if (++writes === 1) entered.resolve(); else duplicate.resolve();
+        await gate.promise;
+      }
+      await write(key, value, ttl);
+    };
+    f.mock((body: any) => { calls++; return f.sse(body, '真实回答', 'p'); });
+    const req: AnthropicRequest = { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: crypto.randomUUID() }] };
+    const first = runSiderController(req, 'upload-concurrent-owner');
+    await entered.promise;
+    const second = runSiderController(req, 'upload-concurrent-owner').catch((error) => error);
+    await Promise.race([duplicate.promise, second]);
+    gate.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    expect(calls).toBe(1);
+    if (b instanceof Error) expect((b as any).statusCode).toBe(429);
+    else expect(a.id).toBe(b.id);
+  });
+});
+
+for (const protocol of ['anthropic', 'openai']) {
+  for (const scenario of ['unconfirmed', 'quota', 'checkpoint']) {
+    test(`Bun上传诊断 HTTP：${protocol} ${scenario} 保留状态、退避和原因`, async () => {
+      await withUploadDiagnosticsFixture(async (f) => {
+        if (scenario === 'checkpoint') process.env.DENO_DEPLOYMENT_ID = 'fixture-deployment';
+        f.mock((body: any) => {
+          if (scenario === 'quota') return new Response(
+            'data: ' + JSON.stringify({ code: 1135, msg: 'Please try again after 1 minutes.' }) + '\n\n',
+            { headers: { 'content-type': 'text/event-stream' } });
+          const part = body.multi_content[0].text.match(/^以下是当前任务上下文片段(\d+)\/(\d+)/);
+          return f.sse(body, scenario === 'unconfirmed' ? '合成私密普通答案。'.repeat(150) : `已记住${part?.[1]}/2`, 'p');
+        });
+        const req = scenario === 'quota'
+          ? { model: 'deepseek-v4-flash', stream: true, messages: [{ role: 'user' as const, content: crypto.randomUUID() }] }
+          : { ...f.request(), stream: scenario !== 'checkpoint' };
+        let response: Response;
+        if (protocol === 'anthropic') response = await controllerResponse(req, 'upload-bun-client', createRequestLogContext(req));
+        else {
+          const { default: router } = await import('../src/routes/protocols');
+          response = await router.request('/v1/chat/completions', { method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-api-key': 'upload-bun-client' },
+            body: JSON.stringify({ model: req.model, stream: req.stream,
+              messages: [...(req.system ? [{ role: 'system', content: req.system }] : []), ...req.messages] }) });
+        }
+        expect(response.status).toBe(scenario === 'unconfirmed' ? 502 : 429);
+        expect(response.headers.get('retry-after')).toBe(scenario === 'unconfirmed' ? null : scenario === 'quota' ? '60' : '1');
+        const json = await response.json();
+        const code = protocol === 'openai' ? json.error.details?.code : json.error.code;
+        expect(code).toBe(scenario === 'unconfirmed' ? 'context_unconfirmed' : scenario === 'quota' ? 'sider_1135' : 'context_checkpoint');
+        expect(JSON.stringify(f.logs)).not.toContain('合成私密普通答案');
+        expect(JSON.stringify(f.logs)).not.toContain('upload-bun-fixture');
+      });
+    });
+  }
+}
+
+for (const protocol of ['anthropic', 'openai']) {
+  test(`Bun上传诊断 HTTP：${protocol} 已提交SSE仍保留具体原因`, async () => {
+    await withUploadDiagnosticsFixture(async (f) => {
+      process.env.SIDER_CONTROLLER_STREAM_COMMIT_MS = '0';
+      f.mock((body: any) => f.sse(body, '合成普通答案。'.repeat(150), 'unconfirmed'));
+      const req = f.request();
+      let response: Response;
+      if (protocol === 'anthropic') response = await controllerResponse(req, 'upload-bun-client', createRequestLogContext(req));
+      else {
+        const { default: router } = await import('../src/routes/protocols');
+        response = await router.request('/v1/chat/completions', { method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-api-key': 'upload-bun-client' },
+          body: JSON.stringify({ model: req.model, stream: true,
+            messages: [{ role: 'system', content: req.system }, ...req.messages] }) });
+      }
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      const error = text.split('\n').filter((line) => line.startsWith('data: {'))
+        .map((line) => JSON.parse(line.slice(6))).find((event) => event.error)?.error;
+      expect(protocol === 'openai' ? error?.details?.code : error?.code).toBe('context_unconfirmed');
+      expect(text).not.toContain('合成普通答案');
+      expect(text).not.toContain('event: message_stop');
+      expect(text).not.toContain('"finish_reason":"stop"');
+    });
+  });
+}

@@ -22,6 +22,12 @@ import { hasProviderDefinedTools } from './request-analyzer.ts';
 import { persistSiderTelemetry } from './sider-telemetry.ts';
 import { recordCachedReplay, recordUsage } from './usage-stats.ts';
 import { applyStopSequences } from './stop-sequences.ts';
+import {
+  createRequestLogContext,
+  logInfo,
+  logWarn,
+  type RequestLogContext,
+} from './request-observability.ts';
 
 const RETENTION_MS = 24 * 60 * 60_000;
 const MIN_DIRECT_WRITE_VERIFY_CHARS = 4_000;
@@ -82,7 +88,12 @@ interface Task {
   copyRef?: string;
 }
 export class ControllerError extends Error {
-  constructor(message: string, public statusCode = 502, public retryAfterMs?: number) {
+  constructor(
+    message: string,
+    public statusCode = 502,
+    public retryAfterMs?: number,
+    public code?: string,
+  ) {
     super(message);
   }
 }
@@ -423,9 +434,17 @@ const CONTEXT_UPLOAD_ACK =
 const CONTEXT_UPLOAD_ACK_FINAL =
   /(?:记住|收到|接收|了解|明白|确认|知悉)[\s\S]{0,40}?(?:全部|所有|上下文|片段|内容|\d+\s*\/\s*\d+)|(?:全部|所有|上下文|片段|\d+\s*\/\s*\d+)[\s\S]{0,40}?(?:记住|收到|接收|了解|明白|确认|知悉)|\b(?:got it|understood|noted|acknowledged)\b|\b(?:received|remembered|memorized)\b[\s\S]{0,40}\b(?:all|chunks?|fragments?|segments?|parts?|context)\b/i;
 
+function contextUploadAcknowledgement(
+  text: string,
+): 'accepted' | 'explicit_rejection' | 'missing_ack' {
+  if (CONTEXT_UPLOAD_REJECTED.test(text)) return 'explicit_rejection';
+  return CONTEXT_UPLOAD_ACK.test(text) || CONTEXT_UPLOAD_ACK_FINAL.test(text)
+    ? 'accepted'
+    : 'missing_ack';
+}
+
 export function contextUploadAccepted(text: string): boolean {
-  if (CONTEXT_UPLOAD_REJECTED.test(text)) return false;
-  return CONTEXT_UPLOAD_ACK.test(text) || CONTEXT_UPLOAD_ACK_FINAL.test(text);
+  return contextUploadAcknowledgement(text) === 'accepted';
 }
 
 /** 识别模型明确拒绝客户端工具协议的回复；普通说明或漏调不在此列。 */
@@ -584,30 +603,55 @@ export async function runSiderController(
   signal?: AbortSignal,
   session?: string,
   sink?: ControllerTextSink,
+  context = createRequestLogContext(request),
 ): Promise<AnthropicResponse> {
   const accounts = await getSiderAccounts();
   if (!accounts.length) throw new ControllerError('未配置Sider主控凭证', 503);
-  const tried = new Set<string>();
-  let candidates = orderedAccounts(accounts);
-  for (;;) {
-    const attempt = await runSiderControllerOnce(
-      request,
-      token,
-      accounts,
-      candidates,
-      signal,
-      session,
-      sink,
-    );
-    if ('response' in attempt) return attempt.response;
-    tried.add(attempt.ranOn);
-    const pinned = accounts.find((account) => account.id === attempt.reroute);
-    if (!pinned) {
-      throw new ControllerError('主控任务绑定的Sider账号已不可用，请恢复该账号或开始新会话', 503);
+  const store = await getControllerStore();
+  const lockKey = `request:${await controllerHash(token)}:${await controllerHash(
+    JSON.stringify({
+      session: session ?? null,
+      request: {
+        ...request,
+        model: getModelById(request.model)?.siderModel ?? request.model,
+        stream: undefined,
+      },
+    }),
+  )}`;
+  const holder = crypto.randomUUID();
+  if (
+    !await store.claim(lockKey, holder, Number(getEnv('SIDER_TOTAL_TIMEOUT_MS', '600000')) + 35000)
+  ) {
+    throw new ControllerError('相同主控请求正在处理中，请稍后重试', 429, 1000, 'controller_busy');
+  }
+  try {
+    const tried = new Set<string>();
+    let candidates = orderedAccounts(accounts);
+    for (;;) {
+      const attempt = await runSiderControllerOnce(
+        request,
+        token,
+        accounts,
+        candidates,
+        signal,
+        session,
+        sink,
+        context,
+      );
+      if ('response' in attempt) return attempt.response;
+      tried.add(attempt.ranOn);
+      const pinned = accounts.find((account) => account.id === attempt.reroute);
+      if (!pinned) {
+        throw new ControllerError('主控任务绑定的Sider账号已不可用，请恢复该账号或开始新会话', 503);
+      }
+      if (tried.has(pinned.id)) throw new ControllerError('主控任务账号归属异常', 500);
+      // 任务已经在该账号建立会话（cid），后续只能由同一账号续轮。
+      candidates = [pinned];
     }
-    if (tried.has(pinned.id)) throw new ControllerError('主控任务账号归属异常', 500);
-    // 任务已经在该账号建立会话（cid），后续只能由同一账号续轮。
-    candidates = [pinned];
+  } finally {
+    await store.release(lockKey, holder).catch(() => {
+      logWarn('controller_request_unlock_failed', { requestId: context.requestId });
+    });
   }
 }
 
@@ -630,6 +674,7 @@ async function runSiderControllerOnce(
   signal?: AbortSignal,
   session?: string,
   sink?: ControllerTextSink,
+  logContext: RequestLogContext = createRequestLogContext(request),
 ): Promise<ControllerAttempt> {
   const model = getModelById(request.model);
   if (!model) {
@@ -705,16 +750,25 @@ async function runSiderControllerOnce(
       let quotaWaited = false;
       // 上下文已登记的流式任务在吐字前最多等待一次，继续使用原总期限和会话。
       const waitForUploadQuota = async (waitMs: number): Promise<boolean> => {
-        if (!request.stream || (!task.pendingUpload && !Object.keys(task.uploads ?? {}).length) || quotaWaited ||
-          waitMs >= totalMs - (Date.now() - started)) return false;
+        if (
+          !request.stream || (!task.pendingUpload && !Object.keys(task.uploads ?? {}).length) ||
+          quotaWaited ||
+          waitMs >= totalMs - (Date.now() - started)
+        ) return false;
         quotaWaited = true;
-        await store.write(`cooldown:${account.id}:${model.siderModel}`, Date.now() + waitMs, waitMs);
+        await store.write(
+          `cooldown:${account.id}:${model.siderModel}`,
+          Date.now() + waitMs,
+          waitMs,
+        );
         await delay(waitMs, undefined, { signal: combined });
         return true;
       };
       const cooldown = await store.read<number>(`cooldown:${account.id}:${model.siderModel}`);
-      if (cooldown && cooldown > Date.now() &&
-        !await waitForUploadQuota(cooldown - Date.now())) {
+      if (
+        cooldown && cooldown > Date.now() &&
+        !await waitForUploadQuota(cooldown - Date.now())
+      ) {
         recordSiderActivity(model.siderModel, { cooldownRejections: 1 });
         throw new ControllerError(
           'Sider模型额度仍在冷却，主控任务保留',
@@ -908,8 +962,10 @@ async function runSiderControllerOnce(
             upstream = await siderClient.chat(body, account.token, combined, forward);
           } catch (error) {
             // 1135 是明确拒绝处理；上下文任务尚未吐字时按上游恢复时间等待一次。
-            if (!combined.aborted && !streamedAny && error instanceof SiderUpstreamError &&
-              error.siderCode === 1135 && await waitForUploadQuota(error.retryAfterMs ?? 60_000)) {
+            if (
+              !combined.aborted && !streamedAny && error instanceof SiderUpstreamError &&
+              error.siderCode === 1135 && await waitForUploadQuota(error.retryAfterMs ?? 60_000)
+            ) {
               upstream = await siderClient.chat(body, account.token, combined, forward);
             } else {
               // 其他情况仅重试明确的建立连接失败；已吐字、读取超时和工具副作用不重试。
@@ -979,20 +1035,18 @@ async function runSiderControllerOnce(
             'Sider未提供可恢复的会话检查点',
           );
         }
-        task.cid = upstream.conversationId;
-        task.parent = upstream.messageIds.assistant;
         totalInputTokens += Math.ceil(prompt.length / 4);
         totalOutputTokens += Math.ceil(
           (upstream.textParts.join('').length + upstream.reasoningParts.join('').length) / 4,
         );
         task.pendingUsage = { input_tokens: totalInputTokens, output_tokens: totalOutputTokens };
-        await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         return upstream;
       };
       let uploaded = 0;
       const upload = async (context: string) => {
         const hash = await controllerHash(context), size = maxChars - 512;
         const count = Math.ceil(context.length / size);
+        const resumed = task.pendingUpload === hash;
         task.uploads ??= {};
         if ((task.uploads[hash] ?? 0) < count && task.pendingUpload !== hash) {
           await saveControllerText(store, `${owner}:${task.id}:upload:${hash}`, context);
@@ -1005,6 +1059,7 @@ async function runSiderControllerOnce(
               `上下文登记进度${i}/${count}，检查点已保存，请自动重试或继续`,
               429,
               1000,
+              'context_checkpoint',
             );
           }
           const uploadStarted = Date.now();
@@ -1023,45 +1078,63 @@ async function runSiderControllerOnce(
                 '上下文登记达到本次时限，检查点已保存，请自动重试或继续',
                 429,
                 1000,
+                'context_checkpoint',
               );
             }
             throw error;
           }
-          if (!contextUploadAccepted(result.textParts.join(''))) {
-            persistSiderTelemetry({
-              ts: Date.now(),
-              model: request.model,
-              strategy: 'controller',
-              ...controllerPayloadDiagnostics(chunk),
-              ok: false,
-              siderCode: 0,
-              ms: Date.now() - uploadStarted,
-              hasTools: !!tools.length,
-              restoredToolUse: false,
-              phase: 'context_upload',
-              outcome: 'context_unconfirmed',
-            });
-            throw new ControllerError(
-              `Sider未确认上下文分片${i + 1}/${count}，已停止后续发送`,
-            );
+          const responseText = result.textParts.join('');
+          const ack = contextUploadAcknowledgement(responseText);
+          const accepted = ack === 'accepted';
+          if (accepted) {
+            // 会话父节点与已确认片数必须在同一个任务值中提交。
+            task.cid = result.conversationId!;
+            task.parent = result.messageIds!.assistant;
+            task.uploads[hash] = i + 1;
           }
-          uploaded++;
-          recordSiderActivity(model.siderModel, { contextUploads: 1 });
-          task.uploads[hash] = i + 1;
           await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
+          const diagnostics = {
+            requestId: logContext.requestId,
+            requestHash: logContext.requestHash,
+            chunkIndex: i + 1,
+            chunkCount: count,
+            contextHash: hash.slice(0, 16),
+            responseChars: responseText.length,
+            ack,
+            resumed,
+            checkpointBefore: i,
+            checkpointAfter: task.uploads[hash] ?? 0,
+            ...(!accepted ? { code: 'context_unconfirmed' } : {}),
+          };
+          logInfo('controller_context_upload', {
+            ...diagnostics,
+            model: request.model,
+            ms: Date.now() - uploadStarted,
+          });
           persistSiderTelemetry({
             ts: Date.now(),
             model: request.model,
             strategy: 'controller',
             ...controllerPayloadDiagnostics(chunk),
-            ok: true,
+            ...diagnostics,
+            ok: accepted,
             siderCode: 0,
             ms: Date.now() - uploadStarted,
             hasTools: !!tools.length,
             restoredToolUse: false,
             phase: 'context_upload',
-            outcome: 'context_accepted',
+            outcome: accepted ? 'context_accepted' : 'context_unconfirmed',
           });
+          if (!accepted) {
+            throw new ControllerError(
+              `Sider未确认上下文分片${i + 1}/${count}，已停止后续发送`,
+              502,
+              undefined,
+              'context_unconfirmed',
+            );
+          }
+          uploaded++;
+          recordSiderActivity(model.siderModel, { contextUploads: 1 });
         }
         if (task.pendingUpload === hash) {
           delete task.pendingUpload;
@@ -1073,6 +1146,7 @@ async function runSiderControllerOnce(
             `上下文登记进度${count}/${count}，检查点已保存，请自动重试或继续`,
             429,
             1000,
+            'context_checkpoint',
           );
         }
       };
@@ -1160,6 +1234,9 @@ async function runSiderControllerOnce(
         }
         const callStarted = Date.now();
         const upstream = await sendText(prompt, streamAnswer ? sink!.onTextDelta : undefined);
+        task.cid = upstream.conversationId!;
+        task.parent = upstream.messageIds!.assistant;
+        await store.write(`${owner}:task:${task.id}`, task, RETENTION_MS);
         const raw = upstream.textParts.join('');
         let calls: AnthropicToolUse[];
         try {

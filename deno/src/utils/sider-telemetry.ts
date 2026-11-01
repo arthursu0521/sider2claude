@@ -60,6 +60,18 @@ export interface SiderTelemetryRecord {
     | 'invalid_tool_intent'
     | 'tool_restored'
     | 'text_answer';
+  /** 上下文登记的可选诊断字段，不含原文或回复预览。 */
+  requestId?: string;
+  requestHash?: string;
+  chunkIndex?: number;
+  chunkCount?: number;
+  contextHash?: string;
+  responseChars?: number;
+  ack?: 'accepted' | 'explicit_rejection' | 'missing_ack';
+  resumed?: boolean;
+  checkpointBefore?: number;
+  checkpointAfter?: number;
+  code?: string;
   correctionCount?: number;
   payloadUtf8Bytes?: number;
   questionMarks?: number;

@@ -6,6 +6,8 @@ import { SiderUpstreamError } from './sider-client.js';
 import { logInfo, logWarn, type RequestLogContext } from './request-observability.js';
 
 function errorBody(error: unknown) {
+  const code = error instanceof ControllerError ? error.code
+    : error instanceof SiderUpstreamError ? `sider_${error.siderCode}` : undefined;
   const status = error instanceof ControllerError || error instanceof SiderUpstreamError
     ? error.statusCode
     : 502;
@@ -25,6 +27,7 @@ function errorBody(error: unknown) {
       type: 'error',
       error: {
         type, message: error instanceof Error ? error.message : '主控请求失败',
+        ...(code ? { code } : {}),
         ...(status === 429 ? { retry_after: Math.ceil((retry ?? 1000) / 1000) } : {}),
       },
     },
@@ -56,7 +59,7 @@ export async function controllerResponse(
   };
   if (!request.stream) {
     try {
-      const response = await runSiderController(request, token, signal, session);
+      const response = await runSiderController(request, token, signal, session, undefined, context);
       return Response.json(response, {
         headers: { ...headers, 'X-Conversation-ID': response.sider_session!.conversation_id },
       });
@@ -154,7 +157,7 @@ export async function controllerResponse(
       };
       void (async () => {
         try {
-          const response = await runSiderController(request, token, combined, session, sink);
+          const response = await runSiderController(request, token, combined, session, sink, context);
           commit();
           for (const [index, block] of response.content.entries()) {
             if (block.type === 'text' && textStarted) {
